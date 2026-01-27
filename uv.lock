@@ -1953,7 +1953,7 @@ requires-dist = [
     { name = "mlflow" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8.0" },
     { name = "omegaconf" },
-    { name = "openai", specifier = "<=2.6.1" },
+    { name = "openai", specifier = ">=2.6.1,<3" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.6.0" },
     { name = "psutil" },
     { name = "pydantic" },

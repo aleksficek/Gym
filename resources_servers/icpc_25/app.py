@@ -7,6 +7,7 @@ import socket
 import subprocess
 import time
 import shutil
+import json
 import threading
 from typing import Optional, Dict, Any
 
@@ -27,14 +28,16 @@ class IcpcVerifyResponse(BaseVerifyResponse):
     details: Dict[str, Any] = {}
 
 class Icpc25ResourcesServerConfig(BaseResourcesServerConfig):
-    test_file: str = "/home/aficek/software/storage/data/icpc_25/metadata/icpc25_metadata.json"
-    sandbox_host: str = "localhost"
+    # test_file: str = "/home/aficek/software/storage/data/icpc_25/metadata/icpc25_metadata.json"
+    test_file: str = "/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_reasoning/users/aficek/synth/data/icpc_25/icpc25_metadata.json"
+    sandbox_host: str = os.getenv("NEMO_SKILLS_SANDBOX_HOST", os.getenv("RAY_HEAD_IP", "localhost"))
     sandbox_port: int = 6000
     test_batch_size: int = 4
     num_parallel_requests: int = 2
     
     sandbox_image: str = "docker.io/igitman/nemo-skills-sandbox:0.7.1"
-    data_volume: str = "/home/aficek/software/storage/data/icpc_25:/home/aficek/software/storage/data/icpc_25"
+    # data_volume: str = "/home/aficek/software/storage/data/icpc_25:/home/aficek/software/storage/data/icpc_25"
+    data_volume: str = "/home/aficek/software/synth/data/icpc_25:/home/aficek/software/synth/data/icpc_25"
 
 
 class Icpc25ResourcesServer(SimpleResourcesServer):
@@ -88,7 +91,7 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
 
     def setup_webserver(self) -> FastAPI:
         # --- AUTO-LAUNCH SANDBOX ---
-        self.launch_sandbox()
+        # self.launch_sandbox()
         # ---------------------------
 
         app = super().setup_webserver()
@@ -129,6 +132,7 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
                         if t:
                             parts.append(t)
                     generation = "\n".join(parts).strip()
+                    print(f"DEBUG: Extracted Generation: {generation!r}")
                     if generation:
                         break
         
@@ -142,7 +146,6 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
             prompt = ""
 
         problem_id = "buggyrover" 
-        print(f"DEBUG: Extracted Problem ID: {problem_id}")
 
         sample = {
             "name": problem_id, # FIX FOR KeyError: 'name'
@@ -156,9 +159,17 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
         try:
             evaluation_result = await self._evaluator.eval_single(sample)
 
-            outputs = evaluation_result.get("test_case_results", {}).get("outputs", [])
+            outputs = []
+            # Check if evaluation_result is valid before accessing it
+            if evaluation_result and isinstance(evaluation_result, dict):
+                test_results = evaluation_result.get("test_case_results")
+                if test_results and isinstance(test_results, dict):
+                    outputs = test_results.get("outputs", [])
+            
             if outputs:
                 reward = sum(o.get("score", 0.0) for o in outputs) / len(outputs)
+            else:
+                reward = 0.0
 
         except Exception as e:
             print(f"CRITICAL ERROR in evaluation: {e}")
@@ -171,6 +182,10 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
             print(f"CRITICAL ERROR in evaluation: {e}")
             reward = 0.0
             evaluation_result = {"error": str(e)}
+
+        print(f"DEBUG: Extracted Problem ID: {problem_id}")
+        print(f"DEBUG: Generation: {generation}")
+        print(f"DEBUG: Evaluation Result: {evaluation_result}")
 
         return IcpcVerifyResponse(
             **body.model_dump(), 
