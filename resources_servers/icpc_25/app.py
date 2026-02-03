@@ -32,11 +32,12 @@ class IcpcVerifyResponse(BaseVerifyResponse):
 
 class Icpc25ResourcesServerConfig(BaseResourcesServerConfig):
     # test_file: str = "/home/aficek/software/storage/data/icpc_25/metadata/icpc25_metadata.json"
-    test_file: str = "/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_reasoning/users/aficek/synth/data/icpc_25/icpc25_metadata.json"
+    test_file: str = os.getenv("TEST_FILE", "/home/aficek/software/storage/data/icpc_25/metadata/icpc25_metadata.json")
     sandbox_host: str = os.getenv("NEMO_SKILLS_SANDBOX_HOST", os.getenv("RAY_HEAD_IP", "localhost"))
     sandbox_port: int = 6000
     test_batch_size: int = 4
     num_parallel_requests: int = 2
+    shared_dir: str = os.getenv("SHARED_TEMP_DIR", "/tmp")
     
     sandbox_image: str = "docker.io/igitman/nemo-skills-sandbox:0.7.1"
     # data_volume: str = "/home/aficek/software/storage/data/icpc_25:/home/aficek/software/storage/data/icpc_25"
@@ -94,7 +95,8 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
 
     def setup_webserver(self) -> FastAPI:
         # --- AUTO-LAUNCH SANDBOX ---
-        # self.launch_sandbox()
+        if os.getenv("SHARED_TEMP_DIR") is None:
+            self.launch_sandbox()
         # ---------------------------
 
         app = super().setup_webserver()
@@ -112,6 +114,7 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
                 "test_file": self.config.test_file,
                 "input_file": None, 
                 "test_batch_size": self.config.test_batch_size,
+                "shared_dir": self.config.shared_dir,
             },
             num_parallel_requests=self.config.num_parallel_requests,
         )

@@ -13,7 +13,7 @@ from nemo_skills.evaluation.evaluator.base import BaseEvaluator, BaseEvaluatorCo
 from nemo_skills.file_utils import jdump
 from nemo_skills.utils import nested_dataclass, unroll_files
 
-SHARED_TEMP_DIR = "/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_reasoning/users/aficek/synth/data/sandbox_files"
+# SHARED_TEMP_DIR = "/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_reasoning/users/aficek/synth/data/sandbox_files"
 
 def sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
@@ -23,6 +23,7 @@ class ICPCEvaluatorConfig(BaseEvaluatorConfig):
     test_file: str = "test_metadata.json"
     input_file: str = None
     test_batch_size: int = 16  # Controls the asyncio Semaphore limit
+    shared_dir: str = "/tmp"
 
 class ICPCEvaluator(BaseEvaluator):
     def __init__(self, config: dict, num_parallel_requests: int = 10):
