@@ -60,7 +60,7 @@ class ICPCEvaluator(BaseEvaluator):
 
     async def _precompile_grader(self, problem_name: str, problem_metadata: dict) -> str:
         """Precompile grader assets on the head node/sandbox."""
-        pre_dir = f"{SHARED_TEMP_DIR}/icpc_pre_{problem_name}_{os.getpid()}"
+        pre_dir = f"{self.eval_cfg.shared_dir}/icpc_pre_{problem_name}_{os.getpid()}"
         os.makedirs(os.path.join(pre_dir, "graders"), exist_ok=True)
 
         for filepath, content in problem_metadata["grader_files"]:
@@ -82,7 +82,7 @@ class ICPCEvaluator(BaseEvaluator):
     async def _run_test_async(self, problem_id: str, code: str, test_input: str, test_output: str, pre_dir: str) -> dict:
         """Full test execution (Compile + Run) logic wrapped in a semaphore."""
         async with self.semaphore:
-            unique_dir = f"{SHARED_TEMP_DIR}/icpc_run_{problem_id}_{time.time_ns()}"
+            unique_dir = f"{self.eval_cfg.shared_dir}/icpc_run_{problem_id}_{time.time_ns()}"
             try:
                 # 1. Setup local environment
                 os.makedirs(os.path.join(unique_dir, "graders"), exist_ok=True)
