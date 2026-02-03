@@ -23,6 +23,9 @@ from nemo_gym.base_resources_server import (
 
 from icpc import ICPCEvaluator
 
+class IcpcVerifyRequest(BaseVerifyRequest):
+    icpc_id: str
+
 # --- Custom Response Class ---
 class IcpcVerifyResponse(BaseVerifyResponse):
     details: Dict[str, Any] = {}
@@ -115,7 +118,7 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
 
         return app
 
-    async def verify(self, body: BaseVerifyRequest) -> IcpcVerifyResponse:
+    async def verify(self, body: IcpcVerifyRequest) -> IcpcVerifyResponse:
         print("DEBUG: Verify request received.")
 
         if not self._evaluator:
@@ -145,7 +148,7 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
         if prompt is None: 
             prompt = ""
 
-        problem_id = "buggyrover" 
+        problem_id = body.icpc_id
 
         sample = {
             "name": problem_id, # FIX FOR KeyError: 'name'
@@ -186,7 +189,17 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
         print(f"DEBUG: Extracted Problem ID: {problem_id}")
         print(f"DEBUG: Generation: {generation}")
         print(f"DEBUG: Evaluation Result: {evaluation_result}")
+        print(f"DEBUG: NEMO_SKILLS_SANDBOX_HOST {os.getenv('NEMO_SKILLS_SANDBOX_HOST')}")
+        try:
+            import httpx
+            async with httpx.AsyncClient() as client:
+                hb_url = f"http://{os.getenv('NEMO_SKILLS_SANDBOX_HOST')}:{os.getenv('NEMO_SKILLS_SANDBOX_PORT')}/health"
+                hb_resp = await client.get(hb_url, timeout=2.0)
+                print(f"DEBUG: Sandbox health check: {hb_resp.status_code}")
+        except Exception as e:
+            print(f"CRITICAL: Worker at {socket.gethostname()} cannot reach sandbox at {os.getenv('NEMO_SKILLS_SANDBOX_HOST')}: {e}")
 
+            
         return IcpcVerifyResponse(
             **body.model_dump(), 
             reward=reward, 
