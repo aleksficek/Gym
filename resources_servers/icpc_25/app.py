@@ -22,6 +22,9 @@ from nemo_gym.base_resources_server import (
 
 from icpc import ICPCEvaluator
 
+class IcpcVerifyRequest(BaseVerifyRequest):
+    icpc_id: str
+
 # --- Custom Response Class ---
 class IcpcVerifyResponse(BaseVerifyResponse):
     details: Dict[str, Any] = {}
@@ -112,11 +115,13 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
 
         return app
 
-    async def verify(self, body: BaseVerifyRequest) -> IcpcVerifyResponse:
+    async def verify(self, body: IcpcVerifyRequest) -> IcpcVerifyResponse:
         print("DEBUG: Verify request received.")
 
         if not self._evaluator:
             raise RuntimeError("Evaluator not initialized.")
+
+        print(f"DEBUG: Body: {body}")
 
         if getattr(body.response, "output", None):
             for out in body.response.output:
@@ -141,8 +146,8 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
         if prompt is None: 
             prompt = ""
 
-        problem_id = "buggyrover" 
-        print(f"DEBUG: Extracted Problem ID: {problem_id}")
+        problem_id = body.icpc_id
+
 
         sample = {
             "name": problem_id, # FIX FOR KeyError: 'name'
@@ -171,6 +176,10 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
             print(f"CRITICAL ERROR in evaluation: {e}")
             reward = 0.0
             evaluation_result = {"error": str(e)}
+
+        print(f"DEBUG: Extracted Problem ID: {problem_id}")
+        print(f"DEBUG: Generation: {generation}")
+        print(f"DEBUG: Evaluation Result: {evaluation_result}")
 
         return IcpcVerifyResponse(
             **body.model_dump(), 
