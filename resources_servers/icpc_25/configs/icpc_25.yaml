@@ -3,6 +3,16 @@ icpc_25_resources_server:
     icpc_25:
       entrypoint: app.py
       domain: coding
+      # On-policy distillation settings (optional)
+      # NOTE: When enable_distillation is false, comment out teacher_model_server to avoid validation errors
+      enable_distillation: false  # Set to true to enable teacher distillation
+      # teacher_model_server:
+      #   type: responses_api_models
+      #   name: teacher_model  # Reference to your teacher model server
+      # teacher_responses_create_params:
+      #   input: []  # Will be populated with student input at runtime
+      distillation_temperature: 1.0  # Temperature for KL->reward conversion
+      max_distillation_reward: 0.5  # Maximum reward from distillation
 icpc_25_simple_agent:
   responses_api_agents:
     simple_agent:
