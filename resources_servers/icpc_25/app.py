@@ -25,6 +25,7 @@ from icpc import ICPCEvaluator
 
 class IcpcVerifyRequest(BaseVerifyRequest):
     icpc_id: str
+    competition: str
 
 # --- Custom Response Class ---
 class IcpcVerifyResponse(BaseVerifyResponse):
@@ -32,7 +33,7 @@ class IcpcVerifyResponse(BaseVerifyResponse):
 
 class Icpc25ResourcesServerConfig(BaseResourcesServerConfig):
     # test_file: str = "/home/aficek/software/storage/data/icpc_25/metadata/icpc25_metadata.json"
-    test_file: str = os.getenv("TEST_FILE", "/home/aficek/software/storage/data/icpc_25/metadata/icpc25_metadata.json")
+    test_file: str = os.getenv("TEST_FILE", "/home/aficek/software/storage/data/icpc/icpc_all_metadata.jsonl")
     sandbox_host: str = os.getenv("NEMO_SKILLS_SANDBOX_HOST", os.getenv("RAY_HEAD_IP", "localhost"))
     sandbox_port: int = 6000
     test_batch_size: int = 4
@@ -127,6 +128,7 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
         if not self._evaluator:
             raise RuntimeError("Evaluator not initialized.")
 
+        generation = ""
         if getattr(body.response, "output", None):
             for out in body.response.output:
                 if getattr(out, "type", None) == "message" and getattr(out, "role", None) == "assistant":
@@ -148,14 +150,16 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
         if not prompt and hasattr(params, "messages") and params.messages:
              prompt = next((m.content for m in reversed(params.messages) if m.role == "user"), "")
         
-        if prompt is None: 
+        if prompt is None:
             prompt = ""
 
         problem_id = body.icpc_id
+        competition = body.competition
 
         sample = {
             "name": problem_id, # FIX FOR KeyError: 'name'
             "icpc_id": problem_id,
+            "competition": competition,
             "generation": generation,
         }
 
@@ -190,6 +194,7 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
             evaluation_result = {"error": str(e)}
 
         print(f"DEBUG: Extracted Problem ID: {problem_id}")
+        print(f"DEBUG: Competition: {competition}")
         print(f"DEBUG: Generation: {generation}")
         print(f"DEBUG: Evaluation Result: {evaluation_result}")
         print(f"DEBUG: NEMO_SKILLS_SANDBOX_HOST {os.getenv('NEMO_SKILLS_SANDBOX_HOST')}")

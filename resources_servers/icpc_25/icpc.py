@@ -29,38 +29,55 @@ class ICPCEvaluator(BaseEvaluator):
     def __init__(self, config: dict, num_parallel_requests: int = 10):
         super().__init__(config, num_parallel_requests)
         self.eval_cfg = ICPCEvaluatorConfig(_init_nested=True, **config)
-        
+
         self.sandbox = None
         self.metadata = None
         self.inputdata = None
         self.precompiled_cache: Dict[str, str] = {}
         # Semaphore prevents overwhelming the sandbox with too many concurrent executions
         self.semaphore = asyncio.Semaphore(self.eval_cfg.test_batch_size)
+        # Lock to prevent race conditions during initialization
+        self._init_lock = asyncio.Lock()
 
     async def _initialize_runtime(self):
         """Lazy initialization of metadata and sandbox on the main event loop."""
-        if self.sandbox is not None:
-            return
+        # Use lock to prevent race conditions
+        async with self._init_lock:
+            # Double-check after acquiring lock
+            if self.sandbox is not None:
+                return
 
-        self.sandbox = LocalSandbox()
-        
-        if not os.path.exists(self.eval_cfg.test_file):
-            raise FileNotFoundError(f"Metadata file {self.eval_cfg.test_file} not found.")
-            
-        def _load_data():
-            with open(self.eval_cfg.test_file, "r") as f:
-                md = json.load(f)
-            idat = None
-            if self.eval_cfg.input_file and os.path.exists(self.eval_cfg.input_file):
-                with open(self.eval_cfg.input_file, "r") as f:
-                    idat = json.load(f)
-            return md, idat
+            self.sandbox = LocalSandbox()
 
-        self.metadata, self.inputdata = await asyncio.to_thread(_load_data)
+            if not os.path.exists(self.eval_cfg.test_file):
+                raise FileNotFoundError(f"Metadata file {self.eval_cfg.test_file} not found.")
 
-    async def _precompile_grader(self, problem_name: str, problem_metadata: dict) -> str:
+            def _load_data():
+                # Load JSONL file where each line contains competition ID and its problems metadata
+                md = {}
+                with open(self.eval_cfg.test_file, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        entry = json.loads(line)
+                        competition = entry["competition"]
+                        # The key is "metadata" not "problems" in the actual file format
+                        problems = entry.get("metadata") or entry.get("problems", {})
+                        md[competition] = problems
+
+                idat = None
+                if self.eval_cfg.input_file and os.path.exists(self.eval_cfg.input_file):
+                    with open(self.eval_cfg.input_file, "r") as f:
+                        idat = json.load(f)
+                return md, idat
+
+            self.metadata, self.inputdata = await asyncio.to_thread(_load_data)
+            print(f"DEBUG: Loaded metadata for competitions: {list(self.metadata.keys())}")
+
+    async def _precompile_grader(self, competition: str, problem_name: str, problem_metadata: dict) -> str:
         """Precompile grader assets on the head node/sandbox."""
-        pre_dir = f"{self.eval_cfg.shared_dir}/icpc_pre_{problem_name}_{os.getpid()}"
+        pre_dir = f"{self.eval_cfg.shared_dir}/icpc_pre_{competition}_{problem_name}_{os.getpid()}"
         os.makedirs(os.path.join(pre_dir, "graders"), exist_ok=True)
 
         for filepath, content in problem_metadata["grader_files"]:
@@ -79,10 +96,10 @@ class ICPCEvaluator(BaseEvaluator):
         await self.sandbox.execute_code(f"cd {pre_dir} && ./compile.sh || true", language="shell", timeout=120)
         return pre_dir
 
-    async def _run_test_async(self, problem_id: str, code: str, test_input: str, test_output: str, pre_dir: str) -> dict:
+    async def _run_test_async(self, competition: str, problem_id: str, code: str, test_input: str, test_output: str, pre_dir: str) -> dict:
         """Full test execution (Compile + Run) logic wrapped in a semaphore."""
         async with self.semaphore:
-            unique_dir = f"{self.eval_cfg.shared_dir}/icpc_run_{problem_id}_{time.time_ns()}"
+            unique_dir = f"{self.eval_cfg.shared_dir}/icpc_run_{competition}_{problem_id}_{time.time_ns()}"
             try:
                 # 1. Setup local environment
                 os.makedirs(os.path.join(unique_dir, "graders"), exist_ok=True)
@@ -140,14 +157,32 @@ class ICPCEvaluator(BaseEvaluator):
 
     async def _evaluate_entry(self, entry: dict) -> dict:
         await self._initialize_runtime()
-        
+
+        competition = entry.get("competition")
+        if not competition:
+            raise ValueError("Missing 'competition' field in entry")
+
         pid = entry["icpc_id"]
-        problem_metadata = self.metadata[pid]
+
+        if competition not in self.metadata:
+            available = list(self.metadata.keys())
+            raise ValueError(f"Competition '{competition}' not found. Available competitions: {available}")
+
+        competition_problems = self.metadata[competition]
+        if competition_problems is None:
+            raise ValueError(f"Competition '{competition}' has no problems loaded (None)")
+
+        if pid not in competition_problems:
+            available_problems = list(competition_problems.keys()) if competition_problems else []
+            raise ValueError(f"Problem '{pid}' not found in competition '{competition}'. Available problems: {available_problems}")
+
+        problem_metadata = competition_problems[pid]
         completion = self._prepare_code(entry["generation"], pid)
 
-        if pid not in self.precompiled_cache:
-            self.precompiled_cache[pid] = await self._precompile_grader(pid, problem_metadata)
-        pre_dir = self.precompiled_cache[pid]
+        cache_key = f"{competition}_{pid}"
+        if cache_key not in self.precompiled_cache:
+            self.precompiled_cache[cache_key] = await self._precompile_grader(competition, pid, problem_metadata)
+        pre_dir = self.precompiled_cache[cache_key]
 
         all_test_configs = []
         for tname, t in problem_metadata["sample_tests"].items():
@@ -157,7 +192,7 @@ class ICPCEvaluator(BaseEvaluator):
 
         # Concurrent execution of all tests for this specific rollout
         tasks = [
-            self._run_test_async(pid, completion, cfg[1], cfg[2], pre_dir) 
+            self._run_test_async(competition, pid, completion, cfg[1], cfg[2], pre_dir)
             for cfg in all_test_configs
         ]
         results = await asyncio.gather(*tasks)
@@ -167,7 +202,7 @@ class ICPCEvaluator(BaseEvaluator):
             res["test_name"] = tname
             res["test_type"] = ttype
             problem_state["outputs"].append(res)
-            
+
             # Binary scoring: if any test in a category fails, the whole category is false
             if res.get("score", 0.0) < 1.0:
                 if ttype == "sample": problem_state["sample_passed"] = False
