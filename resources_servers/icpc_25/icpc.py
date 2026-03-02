@@ -24,6 +24,7 @@ class ICPCEvaluatorConfig(BaseEvaluatorConfig):
     input_file: str = None
     test_batch_size: int = 16  # Controls the asyncio Semaphore limit
     shared_dir: str = "/tmp"
+    scoring: str = "all_correct"  # "all_correct" | "partial" | "sample"
 
 class ICPCEvaluator(BaseEvaluator):
     def __init__(self, config: dict, num_parallel_requests: int = 10):
@@ -96,47 +97,45 @@ class ICPCEvaluator(BaseEvaluator):
         await self.sandbox.execute_code(f"cd {pre_dir} && ./compile.sh || true", language="shell", timeout=120)
         return pre_dir
 
-    async def _run_test_async(self, competition: str, problem_id: str, code: str, test_input: str, test_output: str, pre_dir: str) -> dict:
-        """Full test execution (Compile + Run) logic wrapped in a semaphore."""
+    async def _compile_solution_once(self, competition: str, problem_id: str, code: str, pre_dir: str) -> tuple:
+        """Compile user code once. Returns (compiled_dir, compile_result)."""
+        compiled_dir = f"{self.eval_cfg.shared_dir}/icpc_compiled_{competition}_{problem_id}_{time.time_ns()}"
+        os.makedirs(os.path.join(compiled_dir, "graders"), exist_ok=True)
+        if pre_dir and os.path.isdir(pre_dir):
+            os.system(f"cp -rp {pre_dir}/* {compiled_dir}/")
+
+        with open(os.path.join(compiled_dir, "graders", f"{problem_id}.cpp"), "w") as f:
+            f.write(code)
+
+        compile_result, _ = await self.sandbox.execute_code(
+            f"cd {compiled_dir} && ./compile.sh",
+            language="shell",
+            timeout=60,
+        )
+        return compiled_dir, compile_result
+
+    async def _run_test_async(self, competition: str, problem_id: str, compiled_dir: str, test_input: str, test_output: str) -> dict:
+        """Run a single test case against a pre-compiled binary."""
         async with self.semaphore:
             unique_dir = f"{self.eval_cfg.shared_dir}/icpc_run_{competition}_{problem_id}_{time.time_ns()}"
             try:
-                # 1. Setup local environment
-                os.makedirs(os.path.join(unique_dir, "graders"), exist_ok=True)
-                if pre_dir and os.path.isdir(pre_dir):
-                    os.system(f"cp -rp {pre_dir}/* {unique_dir}/")
-                
-                with open(os.path.join(unique_dir, "graders", f"{problem_id}.cpp"), "w") as f:
-                    f.write(code)
+                # Copy compiled dir (binary already present) and inject test I/O
+                os.makedirs(unique_dir, exist_ok=True)
+                os.system(f"cp -rp {compiled_dir}/* {unique_dir}/")
+
                 with open(os.path.join(unique_dir, "input.txt"), "w") as f:
                     f.write(test_input)
                 with open(os.path.join(unique_dir, "correct_output.txt"), "w") as f:
                     f.write(test_output)
 
-                # 2. Compilation Step
-                compile_result, _ = await self.sandbox.execute_code(
-                    f"cd {unique_dir} && ./compile.sh", 
-                    language="shell", 
-                    timeout=60
-                )
-
-                if compile_result.get("stderr"):
-                    return {
-                        "compile_success": False,
-                        "compile_stderr": compile_result.get("stderr"),
-                        "score": 0.0
-                    }
-
-                # 3. Execution Step (with critical timeout protection)
-                # We use a 30s timeout here to catch infinite loops in model rollouts
+                # Run only — no recompilation
                 run_result, _ = await self.sandbox.execute_code(
-                    f"cd {unique_dir} && ./run.sh", 
-                    language="shell", 
-                    timeout=30 
+                    f"cd {unique_dir} && ./run.sh",
+                    language="shell",
+                    timeout=30,
                 )
 
                 run_stdout = run_result.get("stdout", "").strip()
-                
                 try:
                     score = float(run_stdout) if run_stdout else 0.0
                 except (ValueError, TypeError):
@@ -146,9 +145,9 @@ class ICPCEvaluator(BaseEvaluator):
                     "compile_success": True,
                     "run_stdout": run_stdout,
                     "run_stderr": run_result.get("stderr", ""),
-                    "score": score
+                    "score": score,
                 }
-                
+
             except Exception as e:
                 return {"score": 0.0, "error": str(e)}
             finally:
@@ -190,29 +189,62 @@ class ICPCEvaluator(BaseEvaluator):
         for tname, t in problem_metadata["tests"].items():
             all_test_configs.append((tname, t["input"], t["output"], "test"))
 
-        # Concurrent execution of all tests for this specific rollout
-        tasks = [
-            self._run_test_async(competition, pid, completion, cfg[1], cfg[2], pre_dir)
-            for cfg in all_test_configs
-        ]
-        results = await asyncio.gather(*tasks)
+        # Compile user code once, then run all tests concurrently against the binary
+        compiled_dir = None
+        try:
+            compiled_dir, compile_result = await self._compile_solution_once(competition, pid, completion, pre_dir)
 
-        problem_state = {"outputs": [], "sample_passed": True, "test_passed": True}
+            if compile_result.get("stderr"):
+                compile_err = {
+                    "compile_success": False,
+                    "compile_stderr": compile_result.get("stderr"),
+                    "score": 0.0,
+                }
+                results = [dict(compile_err, test_name=cfg[0], test_type=cfg[3]) for cfg in all_test_configs]
+            else:
+                tasks = [
+                    self._run_test_async(competition, pid, compiled_dir, cfg[1], cfg[2])
+                    for cfg in all_test_configs
+                ]
+                results = await asyncio.gather(*tasks)
+        finally:
+            if compiled_dir and os.path.exists(compiled_dir):
+                shutil.rmtree(compiled_dir, ignore_errors=True)
+
+        problem_state = {"outputs": [], "sample_passed": True, "test_passed": True, "test_pass_count": 0, "test_total": 0}
         for (tname, _, _, ttype), res in zip(all_test_configs, results):
             res["test_name"] = tname
             res["test_type"] = ttype
             problem_state["outputs"].append(res)
 
-            # Binary scoring: if any test in a category fails, the whole category is false
             if res.get("score", 0.0) < 1.0:
                 if ttype == "sample": problem_state["sample_passed"] = False
                 else: problem_state["test_passed"] = False
+
+            if ttype == "test":
+                problem_state["test_total"] += 1
+                if res.get("score", 0.0) >= 1.0:
+                    problem_state["test_pass_count"] += 1
+
+        scoring = self.eval_cfg.scoring
+        if scoring == "partial":
+            total = problem_state["test_total"]
+            final_score = problem_state["test_pass_count"] / total if total > 0 else 0.0
+        elif scoring == "sample":
+            if problem_state["test_passed"]:
+                final_score = 1.0
+            elif problem_state["sample_passed"]:
+                final_score = 0.5
+            else:
+                final_score = 0.0
+        else:  # "all_correct"
+            final_score = float(problem_state["test_passed"])
 
         return {
             "name": entry.get("name", pid),
             "test_case_results": {
                 "sample_score": float(problem_state["sample_passed"]),
-                "score": float(problem_state["test_passed"]),
+                "score": final_score,
                 "outputs": problem_state["outputs"],
             },
             "input_case_results": []

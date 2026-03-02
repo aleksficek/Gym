@@ -36,9 +36,10 @@ class Icpc25ResourcesServerConfig(BaseResourcesServerConfig):
     test_file: str = os.getenv("TEST_FILE", "/home/aficek/software/storage/data/icpc/icpc_all_metadata.jsonl")
     sandbox_host: str = os.getenv("NEMO_SKILLS_SANDBOX_HOST", os.getenv("RAY_HEAD_IP", "localhost"))
     sandbox_port: int = 6000
-    test_batch_size: int = 4
-    num_parallel_requests: int = 2
+    test_batch_size: int = 32
+    num_parallel_requests: int = 8
     shared_dir: str = os.getenv("SHARED_TEMP_DIR", "/tmp")
+    scoring: str = os.getenv("ICPC_SCORING", "all_correct")  # "all_correct" | "partial" | "sample"
     
     sandbox_image: str = "docker.io/igitman/nemo-skills-sandbox:0.7.1"
     # data_volume: str = "/home/aficek/software/storage/data/icpc_25:/home/aficek/software/storage/data/icpc_25"
@@ -113,9 +114,10 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
         self._evaluator = ICPCEvaluator(
             config={
                 "test_file": self.config.test_file,
-                "input_file": None, 
+                "input_file": None,
                 "test_batch_size": self.config.test_batch_size,
                 "shared_dir": self.config.shared_dir,
+                "scoring": self.config.scoring,
             },
             num_parallel_requests=self.config.num_parallel_requests,
         )
@@ -169,17 +171,10 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
         try:
             evaluation_result = await self._evaluator.eval_single(sample)
 
-            outputs = []
-            # Check if evaluation_result is valid before accessing it
+            test_results = None
             if evaluation_result and isinstance(evaluation_result, dict):
                 test_results = evaluation_result.get("test_case_results")
-                if test_results and isinstance(test_results, dict):
-                    outputs = test_results.get("outputs", [])
-            
-            if outputs:
-                reward = sum(o.get("score", 0.0) for o in outputs) / len(outputs)
-            else:
-                reward = 0.0
+            reward = test_results.get("score", 0.0) if test_results else 0.0
 
         except Exception as e:
             print(f"CRITICAL ERROR in evaluation: {e}")
