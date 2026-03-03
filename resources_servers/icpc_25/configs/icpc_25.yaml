@@ -3,6 +3,19 @@ icpc_25_resources_server:
     icpc_25:
       entrypoint: app.py
       domain: coding
+      # On-policy distillation (teacher + student in parallel with execution reward)
+      # For same-model distillation this reuses the same vLLM/OpenAI-compatible endpoint.
+      distillation_enabled: false
+      distillation_weight: 0.2
+      distillation_teacher_mode: same_model
+      # In NeMo RL, policy_base_url can be a list of DP endpoints on multi-node.
+      distillation_base_url: ${policy_base_url}
+      distillation_model: ${policy_model_name}
+      distillation_teacher_base_url: null
+      distillation_teacher_model: null
+      distillation_top_logprobs: 20
+      distillation_max_tokens: 256
+      distillation_compare_max_positions: 256
 icpc_25_simple_agent:
   responses_api_agents:
     simple_agent:

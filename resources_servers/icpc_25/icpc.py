@@ -218,6 +218,38 @@ class ICPCEvaluator(BaseEvaluator):
             "input_case_results": []
         }
 
+    @staticmethod
+    def summarize_test_case_results(evaluation_result: dict) -> Dict[str, float]:
+        """Summarize raw test outputs into reward-oriented aggregate metrics."""
+        outputs = []
+        if isinstance(evaluation_result, dict):
+            test_case_results = evaluation_result.get("test_case_results")
+            if isinstance(test_case_results, dict):
+                maybe_outputs = test_case_results.get("outputs")
+                if isinstance(maybe_outputs, list):
+                    outputs = maybe_outputs
+
+        num_outputs = len(outputs)
+        if num_outputs == 0:
+            return {"reward": 0.0, "num_outputs": 0.0, "num_perfect": 0.0}
+
+        score_sum = 0.0
+        num_perfect = 0
+        for item in outputs:
+            if not isinstance(item, dict):
+                continue
+            score = float(item.get("score", 0.0))
+            score_sum += score
+            if score >= 1.0:
+                num_perfect += 1
+
+        reward = score_sum / max(1, num_outputs)
+        return {
+            "reward": reward,
+            "num_outputs": float(num_outputs),
+            "num_perfect": float(num_perfect),
+        }
+
     def _prepare_code(self, gen: str, pid: str) -> str:
         # Extracts the last C++ block and ensures common headers are present
         pattern = r"```(?:cpp|Cpp)\s*\n(.*?)```"
