@@ -7,7 +7,7 @@ import math
 import os
 import socket
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import httpx
 from fastapi import FastAPI
@@ -57,6 +57,11 @@ class Icpc25ResourcesServerConfig(BaseResourcesServerConfig):
     distillation_temperature: float = 0.0
     distillation_top_p: float = 1.0
     distillation_timeout_seconds: float = 60.0
+    distillation_reward_mode: str = "reward_shaping"
+    distillation_token_weight_scale: float = 0.5
+    distillation_token_weight_min: float = 0.25
+    distillation_token_weight_max: float = 1.75
+    distillation_reward_temperature: float = 10.0
 
     # Usually wired to ${policy_base_url} and ${policy_model_name} in config yaml.
     # base_url may be a list of DP endpoints in multi-node training.
@@ -150,6 +155,74 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
         return generation
 
     @staticmethod
+    def _extract_student_generation_and_token_info(
+        body: IcpcVerifyRequest,
+    ) -> Tuple[str, List[str], List[float]]:
+        generation = ""
+        token_keys: List[str] = []
+        token_logprobs: List[float] = []
+
+        for out in getattr(body.response, "output", []) or []:
+            if hasattr(out, "model_dump"):
+                out_dict = out.model_dump(mode="json")
+            elif isinstance(out, dict):
+                out_dict = out
+            else:
+                continue
+
+            if out_dict.get("type") != "message" or out_dict.get("role") != "assistant":
+                continue
+
+            content = out_dict.get("content") or []
+            text_parts: List[str] = []
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        text = part.get("text")
+                        if isinstance(text, str):
+                            text_parts.append(text)
+            generation = "".join(text_parts)
+
+            raw_token_ids = out_dict.get("generation_token_ids") or []
+            raw_logprobs = out_dict.get("generation_log_probs") or []
+            if isinstance(raw_token_ids, list):
+                for token_id in raw_token_ids:
+                    try:
+                        token_keys.append(f"token_id:{int(token_id)}")
+                    except Exception:
+                        token_keys.append(str(token_id))
+            if isinstance(raw_logprobs, list):
+                for lp in raw_logprobs:
+                    try:
+                        token_logprobs.append(float(lp))
+                    except Exception:
+                        token_logprobs.append(0.0)
+
+            # Fallback for non-training payloads where token-id fields are absent but
+            # response content carries per-token logprobs.
+            if not token_keys and isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    part_logprobs = part.get("logprobs")
+                    if not isinstance(part_logprobs, list):
+                        continue
+                    for token_entry in part_logprobs:
+                        if not isinstance(token_entry, dict):
+                            continue
+                        token = token_entry.get("token")
+                        if token is None:
+                            continue
+                        token_keys.append(Icpc25ResourcesServer._normalize_token_key(token))
+                        try:
+                            token_logprobs.append(float(token_entry.get("logprob", 0.0)))
+                        except Exception:
+                            token_logprobs.append(0.0)
+            break
+
+        return generation, token_keys, token_logprobs
+
+    @staticmethod
     def _input_to_chat_messages(raw_input: Any) -> List[Dict[str, str]]:
         if raw_input is None:
             return []
@@ -212,21 +285,29 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
         base_url: str,
         model: str,
         messages: List[Dict[str, str]],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        extra_payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         url = f"{self._normalize_openai_base_url(base_url)}/chat/completions"
 
         payload = {
             "model": model,
             "messages": messages,
-            "max_tokens": self.config.distillation_max_tokens,
-            "temperature": self.config.distillation_temperature,
-            "top_p": self.config.distillation_top_p,
+            "max_tokens": self.config.distillation_max_tokens if max_tokens is None else max_tokens,
+            "temperature": (
+                self.config.distillation_temperature if temperature is None else temperature
+            ),
+            "top_p": self.config.distillation_top_p if top_p is None else top_p,
             "logprobs": True,
             "top_logprobs": self.config.distillation_top_logprobs,
             "stream": False,
             # Important for stable token identity in vLLM.
             "return_tokens_as_token_ids": True,
         }
+        if extra_payload:
+            payload.update(extra_payload)
 
         timeout = httpx.Timeout(self.config.distillation_timeout_seconds)
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -241,7 +322,17 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
             "text": message.get("content") or "",
             "finish_reason": choice.get("finish_reason"),
             "token_logprobs": logprobs if isinstance(logprobs, list) else [],
+            "raw": data,
         }
+
+    @staticmethod
+    def _normalize_token_key(token: Any) -> str:
+        token_str = str(token)
+        if token_str.startswith("token_id:"):
+            return token_str
+        if token_str.isdigit():
+            return f"token_id:{token_str}"
+        return token_str
 
     @staticmethod
     def _logprob_map(token_entry: Dict[str, Any]) -> Dict[str, float]:
@@ -249,7 +340,7 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
         token = token_entry.get("token")
         logprob = token_entry.get("logprob")
         if token is not None and logprob is not None:
-            token_to_lp[str(token)] = float(logprob)
+            token_to_lp[Icpc25ResourcesServer._normalize_token_key(token)] = float(logprob)
 
         for alt in token_entry.get("top_logprobs") or []:
             if not isinstance(alt, dict):
@@ -258,46 +349,155 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
             alt_logprob = alt.get("logprob")
             if alt_token is None or alt_logprob is None:
                 continue
-            alt_token = str(alt_token)
+            alt_token = Icpc25ResourcesServer._normalize_token_key(alt_token)
             alt_logprob = float(alt_logprob)
             if alt_token not in token_to_lp or alt_logprob > token_to_lp[alt_token]:
                 token_to_lp[alt_token] = alt_logprob
         return token_to_lp
 
     @staticmethod
-    def _probs_from_logprobs(logprob_map: Dict[str, float]) -> Dict[str, float]:
-        if not logprob_map:
-            return {}
-        max_lp = max(logprob_map.values())
-        exp_probs = {token: math.exp(lp - max_lp) for token, lp in logprob_map.items()}
-        z = sum(exp_probs.values())
-        if z <= 0:
-            return {}
-        return {token: value / z for token, value in exp_probs.items()}
+    def _prompt_logprob_entries(raw: Any) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        if not isinstance(raw, list):
+            return entries
 
-    def _kl_teacher_to_student(self, teacher_lp: Dict[str, float], student_lp: Dict[str, float]) -> float:
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+
+            if "token" in item and "logprob" in item:
+                token = Icpc25ResourcesServer._normalize_token_key(item.get("token"))
+                top_logprobs = item.get("top_logprobs") or []
+                entries.append(
+                    {
+                        "token": token,
+                        "logprob": float(item.get("logprob", 0.0)),
+                        "top_logprobs": top_logprobs if isinstance(top_logprobs, list) else [],
+                    }
+                )
+                continue
+
+            best_token: Optional[str] = None
+            best_logprob = -float("inf")
+            top_logprobs: List[Dict[str, Any]] = []
+            for maybe_token, maybe_value in item.items():
+                token = maybe_token
+                logprob: Optional[float] = None
+                if isinstance(maybe_value, dict):
+                    token = maybe_value.get("token", maybe_token)
+                    maybe_logprob = maybe_value.get("logprob")
+                    if maybe_logprob is not None:
+                        logprob = float(maybe_logprob)
+                elif isinstance(maybe_value, (float, int)):
+                    logprob = float(maybe_value)
+
+                if token is None or logprob is None:
+                    continue
+                token_key = Icpc25ResourcesServer._normalize_token_key(token)
+                top_logprobs.append({"token": token_key, "logprob": logprob})
+                if logprob > best_logprob:
+                    best_logprob = logprob
+                    best_token = token_key
+
+            if best_token is not None:
+                entries.append(
+                    {
+                        "token": best_token,
+                        "logprob": best_logprob,
+                        "top_logprobs": top_logprobs,
+                    }
+                )
+        return entries
+
+    @staticmethod
+    def _extract_prompt_logprob_entries(raw_response: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if not isinstance(raw_response, dict):
+            return []
+
+        choice = (raw_response.get("choices") or [{}])[0]
+        if not isinstance(choice, dict):
+            choice = {}
+        choice_logprobs = choice.get("logprobs") or {}
+        if not isinstance(choice_logprobs, dict):
+            choice_logprobs = {}
+
+        candidates = [
+            raw_response.get("prompt_logprobs"),
+            choice.get("prompt_logprobs"),
+            choice_logprobs.get("prompt_logprobs"),
+            choice_logprobs.get("prompt"),
+        ]
+        for candidate in candidates:
+            entries = Icpc25ResourcesServer._prompt_logprob_entries(candidate)
+            if entries:
+                return entries
+        return []
+
+    @staticmethod
+    def _align_prompt_entries_to_student_tokens(
+        prompt_entries: List[Dict[str, Any]],
+        student_token_keys: List[str],
+        max_positions: int,
+    ) -> Tuple[int, List[Dict[str, Any]]]:
+        num_student = len(student_token_keys)
+        if num_student <= 0:
+            return 0, []
+        if len(prompt_entries) <= 0:
+            return 0, []
+
+        prompt_token_keys = [
+            Icpc25ResourcesServer._normalize_token_key(entry.get("token"))
+            for entry in prompt_entries
+        ]
+
+        max_window = min(len(prompt_token_keys), num_student, max_positions)
+        if max_window <= 0:
+            return 0, []
+
+        # Prefer suffix alignment: prompt logprobs may be left-truncated by context
+        # length, so matching the latest student tokens is most robust.
+        for window in range(max_window, 0, -1):
+            student_start = num_student - window
+            student_slice = student_token_keys[student_start : student_start + window]
+            for prompt_start in range(len(prompt_token_keys) - window, -1, -1):
+                if prompt_token_keys[prompt_start : prompt_start + window] == student_slice:
+                    return student_start, prompt_entries[prompt_start : prompt_start + window]
+
+        # Fallback to prefix alignment when suffix alignment is unavailable.
+        for window in range(max_window, 0, -1):
+            student_slice = student_token_keys[:window]
+            if prompt_token_keys[:window] == student_slice:
+                return 0, prompt_entries[:window]
+
+        return 0, []
+
+    def _agreement_weight(self, teacher_lp_map: Dict[str, float], student_token_key: str) -> float:
+        if not teacher_lp_map:
+            return 1.0
+
         floor = self.config.distillation_floor_logprob
-        vocab = set(teacher_lp) | set(student_lp)
-        if not vocab:
-            return 0.0
-
-        teacher_aug = {token: teacher_lp.get(token, floor) for token in vocab}
-        student_aug = {token: student_lp.get(token, floor) for token in vocab}
-        teacher_probs = self._probs_from_logprobs(teacher_aug)
-        student_probs = self._probs_from_logprobs(student_aug)
-        eps = 1e-12
-
-        kl = 0.0
-        for token in vocab:
-            t_prob = teacher_probs.get(token, 0.0)
-            s_prob = max(student_probs.get(token, 0.0), eps)
-            if t_prob > 0:
-                kl += t_prob * (math.log(max(t_prob, eps)) - math.log(s_prob))
-        return max(0.0, kl)
+        student_lp = teacher_lp_map.get(student_token_key, floor)
+        best_lp = max(teacher_lp_map.values())
+        score = math.exp(min(0.0, student_lp - best_lp))
+        weight = 1.0 + self.config.distillation_token_weight_scale * (2.0 * score - 1.0)
+        return float(
+            min(
+                self.config.distillation_token_weight_max,
+                max(self.config.distillation_token_weight_min, weight),
+            )
+        )
 
     async def _compute_distillation(self, body: IcpcVerifyRequest) -> Dict[str, Any]:
         if not self.config.distillation_enabled:
             return {"enabled": False, "status": "disabled", "distillation_loss": 0.0}
+
+        extras = body.model_extra or {}
+        ground_truth_solution = extras.get("ground_truth_solution")
+        if isinstance(ground_truth_solution, str) and ground_truth_solution.strip():
+            print(
+                "[ICPC_DISTILL_DEBUG] ground_truth_solution (interpreted from request extras):\n"
+                f"{ground_truth_solution.strip()}"
+            )
 
         prompt_input = getattr(body.responses_create_params, "input", None)
         prompt_messages = self._input_to_chat_messages(prompt_input)
@@ -346,87 +546,187 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
                 )
             teacher_messages = [{"role": "system", "content": bias_text}] + teacher_messages
 
-        student_task = self._chat_completion_with_logprobs(
-            base_url=student_base_url,
-            model=student_model,
-            messages=prompt_messages,
+        student_generation, student_token_keys, student_token_logprobs = (
+            self._extract_student_generation_and_token_info(body)
         )
-        teacher_task = self._chat_completion_with_logprobs(
+
+        if not student_token_keys:
+            return {
+                "enabled": True,
+                "status": "skipped",
+                "distillation_loss": 0.0,
+                "reason": "no_student_tokens_in_rollout",
+            }
+
+        teacher_prompt_messages = deepcopy(teacher_messages) + [
+            {"role": "assistant", "content": student_generation}
+        ]
+        teacher_prompt_result = await self._chat_completion_with_logprobs(
             base_url=teacher_base_url,
             model=teacher_model,
-            messages=teacher_messages,
+            messages=teacher_prompt_messages,
+            max_tokens=1,
+            temperature=0.0,
+            top_p=1.0,
+            extra_payload={
+                "prompt_logprobs": self.config.distillation_top_logprobs,
+                "return_tokens_as_token_ids": True,
+            },
         )
-        student_result, teacher_result = await asyncio.gather(student_task, teacher_task)
-
-        student_tokens = student_result.get("token_logprobs") or []
-        teacher_tokens = teacher_result.get("token_logprobs") or []
-        aligned = min(
-            len(student_tokens),
-            len(teacher_tokens),
+        prompt_entries = self._extract_prompt_logprob_entries(teacher_prompt_result.get("raw") or {})
+        student_alignment_start, teacher_entries = self._align_prompt_entries_to_student_tokens(
+            prompt_entries,
+            student_token_keys,
             self.config.distillation_compare_max_positions,
         )
-        if aligned <= 0:
+        teacher_scoring_mode = "on_policy_prompt_logprobs"
+
+        if not teacher_entries:
             return {
                 "enabled": True,
                 "status": "skipped",
                 "distillation_loss": 0.0,
-                "reason": "no_aligned_token_logprobs",
-                "student_num_tokens": len(student_tokens),
-                "teacher_num_tokens": len(teacher_tokens),
+                "reason": "teacher_prompt_logprobs_unavailable",
+                "student_num_tokens": len(student_token_keys),
+                "teacher_prompt_entries": len(prompt_entries),
+                "student_alignment_start": student_alignment_start,
             }
 
-        kls: List[float] = []
-        teacher_ce_on_student: List[float] = []
+        max_positions = min(
+            len(teacher_entries),
+            self.config.distillation_compare_max_positions,
+        )
+        if max_positions <= 0:
+            return {
+                "enabled": True,
+                "status": "skipped",
+                "distillation_loss": 0.0,
+                "reason": "no_aligned_teacher_entries",
+                "student_num_tokens": len(student_token_keys),
+                "teacher_num_tokens": len(teacher_entries),
+                "teacher_scoring_mode": teacher_scoring_mode,
+                "student_alignment_start": student_alignment_start,
+            }
+
+        teacher_cross_entropy_on_student: List[float] = []
+        teacher_student_logprob_gap: List[float] = []
+        teacher_minus_student_logprob: List[float] = []
+        teacher_logprob_on_student: List[float] = []
+        student_logprob_on_student: List[float] = []
+        token_advantage_weights: List[float] = [1.0] * max(0, int(student_alignment_start))
         token_agreement = 0
         floor = self.config.distillation_floor_logprob
+        floor_hit_count = 0
+        num_used = 0
 
-        for idx in range(aligned):
-            student_entry = student_tokens[idx]
-            teacher_entry = teacher_tokens[idx]
-            if not isinstance(student_entry, dict) or not isinstance(teacher_entry, dict):
+        for idx in range(max_positions):
+            student_idx = student_alignment_start + idx
+            if student_idx >= len(student_token_keys):
+                break
+            teacher_entry = teacher_entries[idx]
+            if not isinstance(teacher_entry, dict):
+                token_advantage_weights.append(1.0)
                 continue
 
-            student_lp = self._logprob_map(student_entry)
-            teacher_lp = self._logprob_map(teacher_entry)
-            if not student_lp or not teacher_lp:
+            teacher_lp_map = self._logprob_map(teacher_entry)
+            if not teacher_lp_map:
+                token_advantage_weights.append(1.0)
                 continue
 
-            kls.append(self._kl_teacher_to_student(teacher_lp, student_lp))
+            student_token_key = student_token_keys[student_idx]
+            if student_token_key not in teacher_lp_map:
+                floor_hit_count += 1
+            teacher_lp_on_student = teacher_lp_map.get(student_token_key, floor)
+            teacher_cross_entropy_on_student.append(-teacher_lp_on_student)
+            teacher_logprob_on_student.append(teacher_lp_on_student)
+            token_advantage_weights.append(self._agreement_weight(teacher_lp_map, student_token_key))
+            if student_idx < len(student_token_logprobs):
+                student_lp = float(student_token_logprobs[student_idx])
+                student_logprob_on_student.append(student_lp)
+                teacher_student_logprob_gap.append(
+                    abs(teacher_lp_on_student - student_lp)
+                )
+                teacher_minus_student_logprob.append(teacher_lp_on_student - student_lp)
 
-            student_token = str(student_entry.get("token"))
-            teacher_ce_on_student.append(-teacher_lp.get(student_token, floor))
-            if str(student_entry.get("token")) == str(teacher_entry.get("token")):
+            teacher_best_token = max(teacher_lp_map.items(), key=lambda kv: kv[1])[0]
+            if teacher_best_token == student_token_key:
                 token_agreement += 1
+            num_used += 1
 
-        if not kls:
+        if num_used <= 0:
             return {
                 "enabled": True,
                 "status": "skipped",
                 "distillation_loss": 0.0,
-                "reason": "empty_kl_set",
-                "student_num_tokens": len(student_tokens),
-                "teacher_num_tokens": len(teacher_tokens),
+                "reason": "empty_teacher_scores",
+                "student_num_tokens": len(student_token_keys),
+                "teacher_num_tokens": len(teacher_entries),
+                "teacher_scoring_mode": teacher_scoring_mode,
             }
 
-        distillation_loss = float(sum(kls) / len(kls))
-        ce_loss = float(sum(teacher_ce_on_student) / len(teacher_ce_on_student)) if teacher_ce_on_student else 0.0
-        token_agreement_ratio = float(token_agreement / aligned)
+        distillation_loss = float(sum(teacher_cross_entropy_on_student) / num_used)
+        token_agreement_ratio = float(token_agreement / num_used)
+        teacher_disagreement_ratio = float(1.0 - token_agreement_ratio)
+        mean_teacher_logprob_on_student = (
+            float(sum(teacher_logprob_on_student) / len(teacher_logprob_on_student))
+            if teacher_logprob_on_student
+            else 0.0
+        )
+        mean_student_logprob_on_student = (
+            float(sum(student_logprob_on_student) / len(student_logprob_on_student))
+            if student_logprob_on_student
+            else 0.0
+        )
+        mean_teacher_student_logprob_gap = (
+            float(sum(teacher_student_logprob_gap) / len(teacher_student_logprob_gap))
+            if teacher_student_logprob_gap
+            else 0.0
+        )
+        mean_teacher_minus_student_logprob = (
+            float(sum(teacher_minus_student_logprob) / len(teacher_minus_student_logprob))
+            if teacher_minus_student_logprob
+            else 0.0
+        )
+        floor_hit_ratio = float(floor_hit_count / num_used)
+        print(
+            f"[ICPC_DISTILL_DEBUG] {body.competition}:{body.icpc_id} "
+            f"loss={distillation_loss:.4f} agree={token_agreement_ratio:.4f} "
+            f"disagree={teacher_disagreement_ratio:.4f} "
+            f"mean_teacher_lp_on_student={mean_teacher_logprob_on_student:.4f} "
+            f"mean_student_lp={mean_student_logprob_on_student:.4f} "
+            f"abs_gap={mean_teacher_student_logprob_gap:.4f} "
+            f"signed_gap={mean_teacher_minus_student_logprob:.4f} "
+            f"floor_hit_ratio={floor_hit_ratio:.4f} "
+            f"aligned={num_used}/{len(student_token_keys)}"
+        )
 
         return {
             "enabled": True,
             "status": "ok",
             "teacher_mode": self.config.distillation_teacher_mode,
+            "teacher_scoring_mode": teacher_scoring_mode,
             "student_base_url": self._normalize_openai_base_url(student_base_url),
             "student_model": student_model,
             "teacher_base_url": self._normalize_openai_base_url(teacher_base_url),
             "teacher_model": teacher_model,
             "teacher_reference_used": bool(teacher_reference),
             "distillation_loss": distillation_loss,
-            "teacher_cross_entropy_on_student": ce_loss,
+            "teacher_cross_entropy_on_student": distillation_loss,
+            "teacher_student_logprob_gap": mean_teacher_student_logprob_gap,
+            "teacher_minus_student_logprob": mean_teacher_minus_student_logprob,
+            "mean_teacher_logprob_on_student": mean_teacher_logprob_on_student,
+            "mean_student_logprob_on_student": mean_student_logprob_on_student,
             "token_agreement_ratio": token_agreement_ratio,
-            "aligned_positions": aligned,
-            "student_num_tokens": len(student_tokens),
-            "teacher_num_tokens": len(teacher_tokens),
+            "teacher_disagreement_ratio": teacher_disagreement_ratio,
+            "token_advantage_weights": token_advantage_weights,
+            "teacher_floor_hit_count": float(floor_hit_count),
+            "teacher_floor_hit_ratio": floor_hit_ratio,
+            "reward_mode": self.config.distillation_reward_mode,
+            "aligned_positions": num_used,
+            "student_alignment_start": student_alignment_start,
+            "student_num_tokens": len(student_token_keys),
+            "teacher_num_tokens": len(teacher_entries),
+            "teacher_prompt_entries": len(prompt_entries),
         }
 
     async def verify(self, body: IcpcVerifyRequest) -> IcpcVerifyResponse:
@@ -458,6 +758,14 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
             evaluation_result = eval_result_raw if isinstance(eval_result_raw, dict) else {}
             score_summary = ICPCEvaluator.summarize_test_case_results(evaluation_result)
             reward = float(score_summary["reward"])
+            print(
+                f"[ICPC_EVAL_DEBUG] icpc.py raw evaluation result for "
+                f"{body.competition}:{body.icpc_id}: {evaluation_result}"
+            )
+            print(
+                f"[ICPC_EVAL_DEBUG] icpc.py score summary for "
+                f"{body.competition}:{body.icpc_id}: {score_summary}, reward={reward}"
+            )
 
         if isinstance(distill_result_raw, Exception):
             print(f"CRITICAL ERROR in distillation: {distill_result_raw}")
@@ -470,17 +778,42 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
         else:
             distillation_result = distill_result_raw if isinstance(distill_result_raw, dict) else {}
 
+        raw_reward = reward
         distillation_loss = float(distillation_result.get("distillation_loss", 0.0))
-        execution_loss = float(max(0.0, 1.0 - reward))
+        execution_loss = float(max(0.0, 1.0 - raw_reward))
+        reward_for_training = raw_reward
+        shaped_reward = raw_reward
+        distillation_signal = 0.0
+        distillation_bonus = 0.0
         if self.config.distillation_enabled and distillation_result.get("status") == "ok":
             combined_loss = execution_loss + self.config.distillation_weight * distillation_loss
+            token_agreement_ratio = distillation_result.get("token_agreement_ratio", 0.0)
+            try:
+                agreement_signal = float(token_agreement_ratio)
+            except Exception:
+                agreement_signal = 0.0
+            agreement_signal = min(1.0, max(0.0, agreement_signal))
+            temperature = max(1e-6, float(self.config.distillation_reward_temperature))
+            ce_signal = math.exp(-max(0.0, distillation_loss) / temperature)
+            distillation_signal = max(agreement_signal, ce_signal)
+            distillation_bonus = self.config.distillation_weight * distillation_signal
             shaped_reward = max(
                 0.0,
-                min(1.0, reward + self.config.distillation_weight * math.exp(-distillation_loss)),
+                min(1.0, raw_reward + distillation_bonus),
             )
+            if self.config.distillation_reward_mode == "reward_shaping":
+                reward_for_training = shaped_reward
+            elif self.config.distillation_reward_mode == "token_weighted_grpo":
+                reward_for_training = raw_reward
+            else:
+                reward_for_training = shaped_reward
+                distillation_result["reward_mode_warning"] = (
+                    f"unknown_reward_mode:{self.config.distillation_reward_mode}. "
+                    "Falling back to reward_shaping."
+                )
         else:
             combined_loss = execution_loss
-            shaped_reward = reward
+            shaped_reward = raw_reward
 
         details = dict(evaluation_result)
         details["score_summary"] = score_summary
@@ -490,7 +823,13 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
             "distillation_loss": distillation_loss,
             "combined_loss": combined_loss,
             "distillation_weight": self.config.distillation_weight,
+            "reward_mode": self.config.distillation_reward_mode,
+            "raw_reward": raw_reward,
+            "reward_for_training": reward_for_training,
             "shaped_reward": shaped_reward,
+            "distillation_signal": distillation_signal,
+            "distillation_bonus": distillation_bonus,
+            "distillation_reward_temperature": self.config.distillation_reward_temperature,
         }
 
         try:
@@ -509,7 +848,7 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
 
         return IcpcVerifyResponse(
             **body.model_dump(),
-            reward=reward,
+            reward=reward_for_training,
             details=details,
             distillation_loss=distillation_loss,
             execution_loss=execution_loss,
