@@ -54,7 +54,7 @@ class Icpc25ResourcesServerConfig(BaseResourcesServerConfig):
     distillation_compare_max_positions: int = 256
     distillation_top_logprobs: int = 20
     distillation_max_tokens: int = 256
-    distillation_temperature: float = 0.0
+    distillation_temperature: float = 1.0
     distillation_top_p: float = 1.0
     distillation_timeout_seconds: float = 60.0
     distillation_reward_mode: str = "reward_shaping"
@@ -76,9 +76,13 @@ class Icpc25ResourcesServerConfig(BaseResourcesServerConfig):
     # Optional same-model teacher bias; expects request extra field (default: teacher_reference).
     distillation_teacher_reference_field: str = "teacher_reference"
     distillation_teacher_bias_template: str = (
-        "You are the teacher policy for on-policy distillation. "
-        "Use this reference as a strong guide for the correct solution style and logic:\n"
-        "{reference}"
+        "Problem:\n"
+        "{problem}\n\n"
+        "Here is a reference solution:\n"
+        "{reference}\n\n"
+        "After understanding the reference solution, please try to solve this problem\n"
+        "using your own approach below:\n"
+        "Answer:\n"
     )
 
 
@@ -263,6 +267,17 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
 
             messages.append({"role": role, "content": text})
         return messages
+
+    @staticmethod
+    def _messages_to_problem_text(messages: List[Dict[str, str]]) -> str:
+        chunks: List[str] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            text = msg.get("content")
+            if isinstance(text, str) and text.strip():
+                chunks.append(text.strip())
+        return "\n\n".join(chunks).strip()
 
     def _teacher_reference(self, body: IcpcVerifyRequest) -> Optional[str]:
         extras = body.model_extra or {}
@@ -537,14 +552,22 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
         teacher_messages = deepcopy(prompt_messages)
         teacher_reference = self._teacher_reference(body)
         if teacher_reference:
+            teacher_problem = self._messages_to_problem_text(prompt_messages)
             try:
-                bias_text = self.config.distillation_teacher_bias_template.format(reference=teacher_reference)
+                bias_text = self.config.distillation_teacher_bias_template.format(
+                    problem=teacher_problem,
+                    reference=teacher_reference,
+                )
             except Exception:
                 bias_text = (
-                    "You are the teacher policy for on-policy distillation. "
-                    f"Use this reference as strong guidance:\n{teacher_reference}"
+                    f"Problem:\n{teacher_problem}\n\n"
+                    "Here is a reference solution:\n"
+                    f"{teacher_reference}\n\n"
+                    "After understanding the reference solution, please try to solve this problem\n"
+                    "using your own approach below:\n"
+                    "Answer:\n"
                 )
-            teacher_messages = [{"role": "system", "content": bias_text}] + teacher_messages
+            teacher_messages = [{"role": "user", "content": bias_text}]
 
         student_generation, student_token_keys, student_token_logprobs = (
             self._extract_student_generation_and_token_info(body)
@@ -561,13 +584,20 @@ class Icpc25ResourcesServer(SimpleResourcesServer):
         teacher_prompt_messages = deepcopy(teacher_messages) + [
             {"role": "assistant", "content": student_generation}
         ]
+        responses_create_params = getattr(body, "responses_create_params", None)
+        teacher_temperature = getattr(responses_create_params, "temperature", None)
+        teacher_top_p = getattr(responses_create_params, "top_p", None)
+        if teacher_temperature is None:
+            teacher_temperature = self.config.distillation_temperature
+        if teacher_top_p is None:
+            teacher_top_p = self.config.distillation_top_p
         teacher_prompt_result = await self._chat_completion_with_logprobs(
             base_url=teacher_base_url,
             model=teacher_model,
             messages=teacher_prompt_messages,
             max_tokens=1,
-            temperature=0.0,
-            top_p=1.0,
+            temperature=teacher_temperature,
+            top_p=teacher_top_p,
             extra_payload={
                 "prompt_logprobs": self.config.distillation_top_logprobs,
                 "return_tokens_as_token_ids": True,
