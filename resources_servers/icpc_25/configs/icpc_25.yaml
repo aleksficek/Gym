@@ -7,15 +7,31 @@ icpc_25_resources_server:
       # For same-model distillation this reuses the same vLLM/OpenAI-compatible endpoint.
       distillation_enabled: false
       distillation_weight: 0.2
+      distillation_reward_mode: reward_shaping
       distillation_teacher_mode: same_model
       # In NeMo RL, policy_base_url can be a list of DP endpoints on multi-node.
       distillation_base_url: ${policy_base_url}
       distillation_model: ${policy_model_name}
       distillation_teacher_base_url: null
       distillation_teacher_model: null
+      distillation_teacher_reference_field: ground_truth_solution
+      distillation_teacher_bias_template: |
+        Problem:
+        {problem}
+
+        Here is a reference solution:
+        {reference}
+
+        After understanding the reference solution, please try to solve this problem
+        using your own approach below:
+        Answer:
       distillation_top_logprobs: 20
       distillation_max_tokens: 256
       distillation_compare_max_positions: 256
+      distillation_token_weight_scale: 0.5
+      distillation_token_weight_min: 0.25
+      distillation_token_weight_max: 1.75
+      distillation_reward_temperature: 10.0
 icpc_25_simple_agent:
   responses_api_agents:
     simple_agent:

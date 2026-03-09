@@ -266,7 +266,15 @@ class ICPCEvaluator(BaseEvaluator):
         return header + code
 
     async def eval_single(self, data_point: dict):
-        return await self._evaluate_entry(data_point)
+        result = await self._evaluate_entry(data_point)
+        summary = self.summarize_test_case_results(result)
+        competition = data_point.get("competition", "unknown_competition")
+        icpc_id = data_point.get("icpc_id", data_point.get("name", "unknown_problem"))
+        print(
+            f"[ICPC_EVAL_DEBUG] icpc.py eval_single result for {competition}:{icpc_id} "
+            f"summary={summary} test_case_results={result.get('test_case_results')}"
+        )
+        return result
 
     async def eval_full(self, input_files):
         # Implementation for batch JSONL evaluation
