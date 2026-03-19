@@ -74,7 +74,6 @@ class CompetitiveCodingChallengesResourcesServerConfig(BaseResourcesServerConfig
     num_parallel_requests: int = 10
     time_scale: float = 1.0
     shared_dir: str = "/tmp"
-    scoring_strategy: str = "all" # "all", "fraction", "sample"
 
 
 class CompetitiveCodingChallengesResourcesServer(SimpleResourcesServer):
@@ -99,49 +98,17 @@ class CompetitiveCodingChallengesResourcesServer(SimpleResourcesServer):
         score = subtask_meta.get("score")
         return float(score) if score is not None else None
 
-    def _sample_reward(self, outputs: list[dict[str, Any]]) -> Optional[float]:
-        sample_outputs = [
-            float(output.get("score", 0.0) or 0.0)
-            for output in outputs
-            if str(output.get("test_group", "")).lower() in {"sample", "samples", "public"}
-        ]
-        if not sample_outputs:
-            return None
-        return max(0.0, min(1.0, sum(sample_outputs) / len(sample_outputs)))
-
     def _compute_reward(
         self,
         body: CompetitiveCodingChallengesVerifyRequest,
         evaluation_result: dict[str, Any],
     ) -> float:
-        strategy = self.config.scoring_strategy.lower()
-        if strategy not in {"all", "fraction", "sample"}:
-            strategy = "all"
-
         test_case_results = evaluation_result.get("test_case_results") or {}
         if body.subtask and body.subtask in test_case_results:
             subtask_result = test_case_results[body.subtask]
-            outputs = subtask_result.get("outputs") or []
-            if strategy == "sample":
-                reward = self._sample_reward(outputs)
-                if reward is not None:
-                    return reward
-                strategy = "fraction"
-
             score = float(subtask_result.get("score", 0.0) or 0.0)
             max_score = self._subtask_max_score(body)
-            if strategy == "all":
-                return 1.0 if (max_score and score >= max_score) or (max_score is None and score > 0.0) else 0.0
-            if max_score and max_score > 0:
-                return max(0.0, min(1.0, score / max_score))
-            return 1.0 if score > 0.0 else 0.0
-
-        outputs = [out for result in test_case_results.values() for out in (result.get("outputs") or [])]
-        if strategy == "sample":
-            reward = self._sample_reward(outputs)
-            if reward is not None:
-                return reward
-            strategy = "fraction"
+            return 1.0 if (max_score and score >= max_score) or (max_score is None and score > 0.0) else 0.0
 
         total_score = sum(float(result.get("score", 0.0) or 0.0) for result in test_case_results.values())
         problem_meta = {}
@@ -158,16 +125,10 @@ class CompetitiveCodingChallengesResourcesServer(SimpleResourcesServer):
             else:
                 max_total += float(subtask_meta.get("score", 0.0) or 0.0)
 
-        if strategy == "all":
-            if max_total and total_score >= max_total:
-                return 1.0
-            if max_total == 0.0 and all(float(result.get("score", 0.0) or 0.0) > 0.0 for result in test_case_results.values()):
-                return 1.0
-            return 0.0
-        if max_total > 0:
-            return max(0.0, min(1.0, total_score / max_total))
-        if test_case_results:
-            return sum(1.0 for result in test_case_results.values() if float(result.get("score", 0.0) or 0.0) > 0.0) / len(test_case_results)
+        if max_total and total_score >= max_total:
+            return 1.0
+        if max_total == 0.0 and all(float(result.get("score", 0.0) or 0.0) > 0.0 for result in test_case_results.values()):
+            return 1.0
         return 0.0
 
     def setup_webserver(self) -> FastAPI:

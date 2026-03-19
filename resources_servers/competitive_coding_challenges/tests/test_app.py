@@ -48,13 +48,12 @@ from resources_servers.competitive_coding_challenges.app import (
 )
 
 
-def _make_server(scoring_strategy: str = "all") -> CompetitiveCodingChallengesResourcesServer:
+def _make_server() -> CompetitiveCodingChallengesResourcesServer:
     config = CompetitiveCodingChallengesResourcesServerConfig(
         host="0.0.0.0",
         port=8080,
         entrypoint="",
         name="competitive_coding_challenges",
-        scoring_strategy=scoring_strategy,
     )
     return CompetitiveCodingChallengesResourcesServer(
         config=config,
@@ -178,8 +177,8 @@ async def test_verify_passes_competition_context_and_defaults_name(
 
 
 @pytest.mark.asyncio
-async def test_verify_fraction_reward_uses_subtask_metadata_score() -> None:
-    server = _make_server(scoring_strategy="fraction")
+async def test_verify_partial_subtask_score_returns_zero_reward() -> None:
+    server = _make_server()
     request = _make_verify_request(subtask="sub1")
     evaluator = MagicMock()
     evaluator.eval_single = AsyncMock(
@@ -205,34 +204,40 @@ async def test_verify_fraction_reward_uses_subtask_metadata_score() -> None:
 
     response = await server.verify(request)
 
-    assert response.reward == pytest.approx(0.25)
+    assert response.reward == 0.0
     evaluator.get_problem_metadata.assert_called_once_with("prob-1", "comp-1")
 
 
 @pytest.mark.asyncio
-async def test_verify_sample_reward_only_uses_sample_outputs() -> None:
-    server = _make_server(scoring_strategy="sample")
-    request = _make_verify_request(subtask="sub1")
+async def test_verify_full_problem_reward_requires_all_subtasks() -> None:
+    server = _make_server()
+    request = _make_verify_request(subtask=None)
     evaluator = MagicMock()
     evaluator.eval_single = AsyncMock(
         return_value={
             "test_case_results": {
                 "sub1": {
+                    "score": 5.0,
+                    "outputs": [{"score": 1.0, "test_group": "sample"}],
+                },
+                "sub2": {
                     "score": 0.0,
-                    "outputs": [
-                        {"score": 1.0, "test_group": "sample"},
-                        {"score": 0.0, "test_group": "secret"},
-                    ],
+                    "outputs": [{"score": 0.0, "test_group": "secret"}],
                 }
             }
         }
     )
-    evaluator.get_problem_metadata.return_value = {"subtasks": {}}
+    evaluator.get_problem_metadata.return_value = {
+        "subtasks": {
+            "sub1": {"score": 5.0, "aggregation": "min", "test_names": ["t1"]},
+            "sub2": {"score": 7.0, "aggregation": "min", "test_names": ["t2"]},
+        }
+    }
     server._evaluator = evaluator
 
     response = await server.verify(request)
 
-    assert response.reward == 1.0
+    assert response.reward == 0.0
 
 
 @pytest.mark.asyncio
