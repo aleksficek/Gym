@@ -12,6 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+import logging
+import os
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI
@@ -26,6 +30,11 @@ from nemo_gym.base_resources_server import (
 
 import ccc_eval as ccc_eval_module
 from ccc_eval import CCCEvaluator
+
+
+LOG = logging.getLogger(__name__)
+
+LOG_JSONL_PATH = os.environ.get("CCC_LOG_JSONL_PATH", None)
 
 
 class CompetitiveCodingChallengesVerifyRequest(BaseVerifyRequest):
@@ -80,6 +89,7 @@ class CompetitiveCodingChallengesResourcesServer(SimpleResourcesServer):
     config: CompetitiveCodingChallengesResourcesServerConfig
 
     _evaluator: Optional[CCCEvaluator] = PrivateAttr(default=None)
+    _log_lock: Optional[Any] = PrivateAttr(default=None)
 
     def _subtask_max_score(self, body: CompetitiveCodingChallengesVerifyRequest) -> Optional[float]:
         if body.subtask_score is not None:
@@ -139,6 +149,8 @@ class CompetitiveCodingChallengesResourcesServer(SimpleResourcesServer):
             f"{self.config.model_dump_json(indent=2)}"
         )
 
+        print(f"CCC_LOG_JSONL_PATH: {LOG_JSONL_PATH}")
+
         self._evaluator = CCCEvaluator(
             config={
                 "test_file": self.config.test_file,
@@ -178,7 +190,50 @@ class CompetitiveCodingChallengesResourcesServer(SimpleResourcesServer):
         except Exception as e:
             details = {"error": str(e)}
 
+        if LOG_JSONL_PATH:
+            await self._append_log_jsonl(
+                log_path=LOG_JSONL_PATH,
+                competition_id=body.competition_id,
+                problem_id=body.problem_id,
+                subtask=body.subtask,
+                generated_sequence=_extract_last_assistant_text(body),
+                reward=reward,
+                details=details,
+            )
+
         return CompetitiveCodingChallengesVerifyResponse(**payload, reward=reward, details=details)
+
+    async def _append_log_jsonl(
+        self,
+        *,
+        log_path: str,
+        competition_id: Optional[str],
+        problem_id: str,
+        subtask: Optional[str],
+        generated_sequence: str,
+        reward: float,
+        details: dict[str, Any],
+    ) -> None:
+        import asyncio
+
+        if self._log_lock is None:
+            self._log_lock = asyncio.Lock()
+
+        try:
+            record = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "competition_id": competition_id,
+                "problem_id": problem_id,
+                "subtask": subtask,
+                "generated_sequence": generated_sequence,
+                "reward": reward,
+                **details,
+            }
+            async with self._log_lock:
+                with open(log_path, "a", encoding="utf-8") as fout:
+                    fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            LOG.warning("[competitive_coding_challenges] Failed to append log_jsonl %s: %s", log_path, exc)
 
 
 if __name__ == "__main__":
