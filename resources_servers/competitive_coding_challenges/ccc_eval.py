@@ -392,12 +392,14 @@ def run_test_case(task_args: dict, worker_id: int) -> dict:
             return result
 
         run_timeout = max(1, int(120 * float(task_args.get("time_scale", 1.0))))
+        run_start = time.monotonic()
         run_result = _test_exec_sync(
             sandbox,
             f"cd {unique_dir} && export TMPDIR={unique_dir}/tmp && TIME_LIMIT_SCALE={task_args.get('time_scale', 1.0)} ./run.sh",
             language="shell",
             timeout=run_timeout,
         )
+        result["run_time_s"] = time.monotonic() - run_start
         result["run_stdout"] = run_result.get("stdout", "")
         result["run_stderr"] = run_result.get("stderr", "")
         try:
@@ -466,22 +468,27 @@ class CCCEvaluator(BaseEvaluator):
         self.problem_index = None
         self.precompiled_cache = {}
         self.pool = None
+        self._init_lock = asyncio.Lock()
 
     async def _initialize_runtime(self):
         if self.sandbox is not None:
             return
 
-        def _setup():
-            sbox = LocalSandbox()
-            wait_for_sandbox(sbox)
-            sbox._owner_tid = threading.get_ident()
-            if not os.path.exists(self.eval_cfg.test_file):
-                raise FileNotFoundError(f"Metadata file {self.eval_cfg.test_file} does not exist.")
-            metadata_by_competition_local, problem_index_local = _load_metadata_file(self.eval_cfg.test_file)
-            pool_local = ThreadPoolExecutor(max_workers=self.eval_cfg.test_batch_size)
-            return sbox, metadata_by_competition_local, problem_index_local, pool_local
+        async with self._init_lock:
+            if self.sandbox is not None:
+                return
 
-        self.sandbox, self.metadata_by_competition, self.problem_index, self.pool = await asyncio.to_thread(_setup)
+            def _setup():
+                sbox = LocalSandbox()
+                wait_for_sandbox(sbox)
+                sbox._owner_tid = threading.get_ident()
+                if not os.path.exists(self.eval_cfg.test_file):
+                    raise FileNotFoundError(f"Metadata file {self.eval_cfg.test_file} does not exist.")
+                metadata_by_competition_local, problem_index_local = _load_metadata_file(self.eval_cfg.test_file)
+                pool_local = ThreadPoolExecutor(max_workers=self.eval_cfg.test_batch_size)
+                return sbox, metadata_by_competition_local, problem_index_local, pool_local
+
+            self.sandbox, self.metadata_by_competition, self.problem_index, self.pool = await asyncio.to_thread(_setup)
         # Keep a flat fast-path for legacy callers when problem ids are globally unique.
         self.metadata = {
             problem_id: next(iter(problem_metadata_by_comp.values()))
@@ -604,6 +611,7 @@ class CCCEvaluator(BaseEvaluator):
 
         all_test_items = list(problem_metadata["all_tests"].items())
         batch_size = self.eval_cfg.test_batch_size
+        all_run_times: list[float] = []
         for i in range(0, len(all_test_items), batch_size):
             candidate_batch = all_test_items[i : i + batch_size]
             batch = []
@@ -626,6 +634,8 @@ class CCCEvaluator(BaseEvaluator):
             futures = [loop.run_in_executor(self.pool, run_test_case, task, idx) for idx, task in enumerate(tasks)]
             results = await asyncio.gather(*futures)
             for (test_name, _), result in zip(batch, results):
+                if "run_time_s" in result:
+                    all_run_times.append(result["run_time_s"])
                 result["test_name"] = test_name
                 test_group = problem_metadata["all_tests"][test_name].get("group")
                 if test_group is not None:
@@ -647,10 +657,14 @@ class CCCEvaluator(BaseEvaluator):
             }
 
 
+        num_tests_run = len(all_run_times)
         return {
             "name": entry["name"],
             "subtask": entry["subtask"],
             "test_case_results": test_case_results,
+            "num_tests_run": num_tests_run,
+            "total_test_execution_time_s": sum(all_run_times),
+            "mean_test_execution_time_s": sum(all_run_times) / num_tests_run if num_tests_run else 0.0,
         }
 
     async def eval_full(self, input_files):  # type: ignore[override]

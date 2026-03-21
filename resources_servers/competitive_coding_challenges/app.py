@@ -56,6 +56,9 @@ class CompetitiveCodingChallengesVerifyResponse(BaseVerifyResponse):
     name: Optional[str] = None
     subtask_score: Optional[float] = None
     details: dict[str, Any] = Field(default_factory=dict)
+    num_tests_run: int = 0
+    total_test_execution_time_s: float = 0.0
+    mean_test_execution_time_s: float = 0.0
 
 
 def _extract_last_assistant_text(body: BaseVerifyRequest) -> str:
@@ -163,6 +166,14 @@ class CompetitiveCodingChallengesResourcesServer(SimpleResourcesServer):
         # The copied evaluator's module-level helpers still reference `self`.
         ccc_eval_module.self = self._evaluator
 
+        evaluator = self._evaluator
+
+        @app.on_event("startup")
+        async def _eager_init():
+            print("CCC: pre-loading metadata (~27 GB, ~46s) before first request...")
+            await evaluator._initialize_runtime()
+            print("CCC: metadata loaded, server ready.")
+
         return app
 
     async def verify(
@@ -201,7 +212,14 @@ class CompetitiveCodingChallengesResourcesServer(SimpleResourcesServer):
                 details=details,
             )
 
-        return CompetitiveCodingChallengesVerifyResponse(**payload, reward=reward, details=details)
+        return CompetitiveCodingChallengesVerifyResponse(
+            **payload,
+            reward=reward,
+            details=details,
+            num_tests_run=details.get("num_tests_run", 0),
+            total_test_execution_time_s=details.get("total_test_execution_time_s", 0.0),
+            mean_test_execution_time_s=details.get("mean_test_execution_time_s", 0.0),
+        )
 
     async def _append_log_jsonl(
         self,
